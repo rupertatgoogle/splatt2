@@ -1,0 +1,23 @@
+# Splatt2 Target Definition — 10m Air Rifle (ISSF)
+# Source: ISSF Technical Rules Section 6.6
+# Visual ring diameters only — scoring is computed from geometry at runtime.
+# card_diameter_mm = outermost ring diameter (the 1-ring)
+key,10m_air_rifle
+name,10m Air Rifle (ISSF)
+gauging,outward
+calibre_mm,4.5
+reference_dist_m,10.0
+aiming_mark_dia_mm,30.5
+card_diameter_mm,45.5
+
+score,ring_diameter_mm
+10,0.5
+9,5.5
+8,10.5
+7,15.5
+6,20.5
+5,25.5
+4,30.5
+3,35.5
+2,40.5
+1,45.5

@@ -1,0 +1,18 @@
+# Splatt2 Target Definition — 6 Yard Air Rifle (NSRA 1989)
+# Inward gauging
+key,6yd_air_rifle
+name,6 Yard Air Rifle (NSRA)
+gauging,inward
+calibre_mm,5.6
+reference_dist_m,6.0
+aiming_mark_dia_mm,5.0
+card_diameter_mm,31.0
+
+score,ring_diameter_mm
+10,1.0
+9,6.0
+8,11.0
+7,16.0
+6,21.0
+5,26.0
+4,31.0
