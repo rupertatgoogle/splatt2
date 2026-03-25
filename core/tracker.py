@@ -205,52 +205,62 @@ def score_shot(
     aim_mm: tuple,
     scoring_radius_mm: float,
     decimal: bool = False,
+    mark_offsets: list = None,
 ) -> tuple:
     """
     Score a shot purely from geometry.
 
-    Parameters
-    ----------
-    aim_mm : (x, y) position of shot centre in mm from target centre.
+    aim_mm            : (x, y) in mm from sheet centre.
     scoring_radius_mm : R = card_radius + calibre_radius.
-        R = target_cfg["diameter_mm"]/2 + calibre_mm/2.
-        This is the only geometric quantity used for scoring.
-        Changing calibre shifts all bands automatically.
+    decimal           : 99 bands (10.9->1.0) if True; 10 bands (10->1) if False.
+    mark_offsets      : list of (x_mm, y_mm) mark centres for multi-mark targets.
+                        If None, scores relative to (0,0) — single-mark behaviour
+                        unchanged. If multiple marks, assigns shot to nearest mark
+                        (Option C) and scores relative to that mark centre.
 
-    decimal : if True,  99 equal bands of width R/99.
-                        Band 0 (centre) → 10.9
-                        Band 98 (outer edge) → 1.0
-                        Score = round(10.9 - n * 0.1, 1)
-              if False, 10 equal bands of width R/10.
-                        Band 0 → 10, band 9 → 1.
-
-    Returns (score, band_index).  score=0.0, band=-1 for a complete miss.
-
-    The visual ring diameters in the CSV are NOT used here — they only
-    drive the on-screen target rendering.
+    Returns (score, band_index, mark_index).
+    mark_index is always 0 for single-mark targets.
+    score=0.0, band=-1, mark_index=0 for a complete miss.
     """
     import math as _math
-    aim_r = _math.sqrt(aim_mm[0] ** 2 + aim_mm[1] ** 2)
+
+    # Multi-mark: find nearest mark centre
+    if mark_offsets and len(mark_offsets) > 1:
+        best_dist  = float("inf")
+        best_mark  = 0
+        best_local = aim_mm
+        for idx, (mx, my) in enumerate(mark_offsets):
+            dx = aim_mm[0] - mx
+            dy = aim_mm[1] - my
+            d  = _math.sqrt(dx*dx + dy*dy)
+            if d < best_dist:
+                best_dist  = d
+                best_mark  = idx
+                best_local = (dx, dy)
+        aim_local = best_local
+        mark_idx  = best_mark
+    else:
+        aim_local = aim_mm
+        mark_idx  = 0
+
+    aim_r = _math.sqrt(aim_local[0]**2 + aim_local[1]**2)
 
     if aim_r > scoring_radius_mm:
-        return 0.0, -1   # complete miss
+        return 0.0, -1, mark_idx
 
     if decimal:
-        # 99 equal bands spanning R: band 0 → 10.9, band 98 → 1.0
-        # Step = (10.9 - 1.0) / 98 = 9.9/98 per band
         n_bands = 99
-        step    = 9.9 / 98          # exactly maps band 98 to score 1.0
+        step    = 9.9 / 98
         band_w  = scoring_radius_mm / n_bands
         band_n  = min(int(aim_r / band_w), n_bands - 1)
         score   = round(10.9 - band_n * step, 1)
-        return score, band_n
+        return score, band_n, mark_idx
     else:
-        # 10 equal bands: band 0 → 10, band 9 → 1
         n_bands = 10
         band_w  = scoring_radius_mm / n_bands
         band_n  = min(int(aim_r / band_w), n_bands - 1)
         score   = float(10 - band_n)
-        return score, band_n
+        return score, band_n, mark_idx
 
 def aim_to_display(aim_mm, target_cfg, display_size_px):
     """

@@ -176,6 +176,7 @@ class Shot:
     favourite: bool = False    # marked for review
     missed: bool = False       # missed the target entirely
     comments: str = ""
+    mark_index: int = 0    # which aiming mark (0 for single-mark targets)
 
     @property
     def radius_mm(self) -> float:
@@ -361,6 +362,7 @@ class Session:
         score: float,
         ring_index: int,
         shot_timestamp: Optional[float] = None,
+        mark_index: int = 0,
     ) -> Optional[Shot]:
         """
         Register a shot.
@@ -418,6 +420,7 @@ class Session:
             series=self.current_series,
             trace=trace,
             aim_centrepoint=trace.aim_centrepoint(self.acp_fraction),
+            mark_index=mark_index,
         )
         self.shots.append(shot)
 

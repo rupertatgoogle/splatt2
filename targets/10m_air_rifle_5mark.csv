@@ -1,0 +1,31 @@
+# Splatt2 Target Definition — 10m Air Rifle 5-Mark (NSRA)
+# Standard NSRA competition card: 5 aiming marks in quincunx pattern
+# Centre mark at (0,0); corner marks at 75mm centre-to-centre spacing
+#
+# Scoring (Option C): each shot assigned to nearest mark centre,
+# then scored relative to that mark using standard geometry.
+key,10m_air_rifle_5mark
+name,10m Air Rifle 5-Mark (NSRA)
+gauging,outward
+calibre_mm,4.5
+reference_dist_m,10.0
+aiming_mark_dia_mm,30.5
+card_diameter_mm,45.5
+
+# Multi-mark configuration
+mark_count,5
+mark_spacing_mm,75
+# mark_spacing_mm is the side of the square (corner-to-corner = 75mm)
+# Each corner mark is at +-37.5mm on each axis from centre
+
+score,ring_diameter_mm
+10,0.5
+9,5.5
+8,10.5
+7,15.5
+6,20.5
+5,25.5
+4,30.5
+3,35.5
+2,40.5
+1,45.5

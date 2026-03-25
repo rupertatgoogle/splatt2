@@ -52,6 +52,7 @@ def _get_aiming_marks():
             "ring_labels":        t.get("ring_labels",
                                         [str(int(s)) if s == int(s) else str(s)
                                          for s in t["ring_scores"]]),
+            "mark_offsets":       t.get("mark_offsets"),   # None for single-mark
         }
     return marks
 
@@ -116,39 +117,48 @@ def generate_marker_sheet(
         ly = y + marker_px + mm(5) if mid in (0, 1) else y - mm(2)
         cv2.putText(img, labels[mid], (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 1.0, 0, 2)
 
-    # ── Draw aiming mark in centre ────────────────────────────────────────────
+    # ── Draw aiming mark(s) ───────────────────────────────────────────────────
     cx, cy = A4_W_PX // 2, A4_H_PX // 2
 
-    # Optional scoring ring guides (dashed)
-    if show_ring_guides:
-        for i, ring_dia in enumerate(mark_cfg["rings_dia_mm"]):
-            r_px = mm(ring_dia / 2 * scale_pct)
-            if r_px < 4:
-                continue
-            _draw_dashed_circle(img, cx, cy, r_px, shade=160, n_dashes=48)
-            # Label at 3 o'clock
-            lbl = mark_cfg["ring_labels"][i] if i < len(mark_cfg["ring_labels"]) else ""
-            if lbl:
-                cv2.putText(img, lbl, (cx + r_px + mm(1), cy + mm(1)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, 120, 1)
-
-    # Outer boundary solid circle
-    outer_r_px = mm(outer_dia_scaled / 2)
-    if outer_r_px > 4:
-        cv2.circle(img, (cx, cy), outer_r_px, 100, 2)
-
-    # Aiming mark (black filled circle)
-    aim_r_px = mm(aiming_dia_scaled / 2)
-    if aim_r_px > 2:
-        cv2.circle(img, (cx, cy), aim_r_px, 0, -1)   # filled black
+    # For multi-mark targets, compute each mark's pixel position.
+    # mark_offsets are in mm from sheet centre; scale_pct shrinks them for
+    # closer distances just like the rings.
+    mark_offsets = mark_cfg.get("mark_offsets")   # None for single-mark targets
+    if mark_offsets:
+        centres_px = [
+            (cx + mm(mx * scale_pct), cy + mm(my * scale_pct))
+            for mx, my in mark_offsets
+        ]
     else:
-        # Too small to fill — draw a dot
-        cv2.circle(img, (cx, cy), max(3, mm(0.5)), 0, -1)
+        centres_px = [(cx, cy)]
 
-    # Centre cross (white, visible on black)
-    cross = max(mm(2), aim_r_px // 4)
-    cv2.line(img, (cx - cross, cy), (cx + cross, cy), 255, 2)
-    cv2.line(img, (cx, cy - cross), (cx, cy + cross), 255, 2)
+    def _draw_one_mark(ocx, ocy, show_labels):
+        """Draw rings, outer boundary, black bull, and cross at (ocx, ocy)."""
+        if show_ring_guides:
+            for i, ring_dia in enumerate(mark_cfg["rings_dia_mm"]):
+                r_px = mm(ring_dia / 2 * scale_pct)
+                if r_px < 4:
+                    continue
+                _draw_dashed_circle(img, ocx, ocy, r_px, shade=160, n_dashes=48)
+                if show_labels:
+                    lbl = mark_cfg["ring_labels"][i] if i < len(mark_cfg["ring_labels"]) else ""
+                    if lbl:
+                        cv2.putText(img, lbl, (ocx + r_px + mm(1), ocy + mm(1)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, 120, 1)
+        outer_r_px = mm(outer_dia_scaled / 2)
+        if outer_r_px > 4:
+            cv2.circle(img, (ocx, ocy), outer_r_px, 100, 2)
+        aim_r_px = mm(aiming_dia_scaled / 2)
+        if aim_r_px > 2:
+            cv2.circle(img, (ocx, ocy), aim_r_px, 0, -1)
+        else:
+            cv2.circle(img, (ocx, ocy), max(3, mm(0.5)), 0, -1)
+        cross = max(mm(2), aim_r_px // 4)
+        cv2.line(img, (ocx - cross, ocy), (ocx + cross, ocy), 255, 2)
+        cv2.line(img, (ocx, ocy - cross), (ocx, ocy + cross), 255, 2)
+
+    for i, (ocx, ocy) in enumerate(centres_px):
+        _draw_one_mark(ocx, ocy, show_labels=(i == 0))
 
     # ── Print instructions ────────────────────────────────────────────────────
     instr_lines = [

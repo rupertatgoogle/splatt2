@@ -34,10 +34,12 @@ C_ACP        = (255, 200,   0)
 class TargetRenderer:
     def __init__(self, canvas_size: Tuple[int, int], target_cfg: dict,
                  display_calibre_mm: float = None,
-                 display_cfg: dict = None):
+                 display_cfg: dict = None,
+                 zoom: float = 1.0):
         self.cw, self.ch = canvas_size
         self.target_cfg = target_cfg
         self.calibre_mm = display_calibre_mm or target_cfg.get("calibre_mm", 4.5)
+        self.zoom = max(0.1, float(zoom))
         dc = display_cfg or {}
         # Colours from display config (fall back to hardcoded defaults)
         self.C_shot_fill = _hex_to_bgr(dc.get("colour_shot_fill",  "#5050ff"))
@@ -55,8 +57,16 @@ class TargetRenderer:
         self.trace_preshot_s = float(dc.get("trace_preshot_s", 1.0))
         self.trace_final_s   = float(dc.get("trace_final_s",   0.2))
 
+        # For multi-mark targets, the effective visual diameter is larger than
+        # the single card diameter — use the full span of all marks.
         target_dia = target_cfg["diameter_mm"]
-        usable = min(self.cw, self.ch) * 0.88
+        mark_offsets = target_cfg.get("mark_offsets")
+        if mark_offsets:
+            import math as _m
+            max_reach = max(_m.sqrt(mx**2 + my**2) for mx, my in mark_offsets)
+            # Full span = furthest mark centre + one card radius on each side
+            target_dia = (max_reach + target_dia / 2) * 2
+        usable = min(self.cw, self.ch) * 0.88 * self.zoom
         self.scale = usable / target_dia
 
         self.cx = self.cw // 2
@@ -153,29 +163,37 @@ class TargetRenderer:
     # ── Static target face ────────────────────────────────────────────────────
 
     def _render_static(self) -> np.ndarray:
-        img = np.full((self.ch, self.cw, 3), C_BG, dtype=np.uint8)
+        img    = np.full((self.ch, self.cw, 3), C_BG, dtype=np.uint8)
         rings  = self.target_cfg["rings_mm"]
         scores = self.target_cfg["ring_scores"]
+        # Multi-mark: draw rings at each mark centre; single-mark: draw at canvas centre
+        mark_offsets = self.target_cfg.get("mark_offsets")
+        centres = [self.mm_to_px((mx, my)) for mx, my in mark_offsets] \
+                  if mark_offsets else [(self.cx, self.cy)]
 
-        for i in reversed(range(len(rings))):
-            r = self.radius_to_px(rings[i])
-            fill = (15, 15, 15) if i >= len(rings) - 4 else (240, 240, 240)
-            cv2.circle(img, (self.cx, self.cy), r, fill, -1)
-            cv2.circle(img, (self.cx, self.cy), r, C_RING_OUTER, 1)
-            if i < len(rings) - 1:
-                sc = scores[i]
-                lbl = str(int(sc)) if sc == int(sc) else str(sc)
-                tc  = (200, 200, 200) if i >= len(rings) - 4 else (80, 80, 80)
-                mid_r = (rings[i] + (rings[i-1] if i > 0 else 0)) / 2
-                lx = int(self.cx + mid_r * self.scale * 0.6)
-                cv2.putText(img, lbl, (lx, self.cy + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, tc, 1, cv2.LINE_AA)
+        for ci, (ocx, ocy) in enumerate(centres):
+            for i in reversed(range(len(rings))):
+                r = self.radius_to_px(rings[i])
+                fill = (15, 15, 15) if i >= len(rings) - 4 else (240, 240, 240)
+                cv2.circle(img, (ocx, ocy), r, fill, -1)
+                cv2.circle(img, (ocx, ocy), r, C_RING_OUTER, 1)
+                # Score labels only on first mark to avoid clutter
+                if ci == 0 and i < len(rings) - 1:
+                    sc  = scores[i]
+                    lbl = str(int(sc)) if sc == int(sc) else str(sc)
+                    tc  = (200, 200, 200) if i >= len(rings) - 4 else (80, 80, 80)
+                    mid_r = (rings[i] + (rings[i-1] if i > 0 else 0)) / 2
+                    lx = int(ocx + mid_r * self.scale * 0.6)
+                    cv2.putText(img, lbl, (lx, ocy + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, tc, 1, cv2.LINE_AA)
+            cv2.circle(img, (ocx, ocy),
+                       max(2, self.radius_to_px(0.5)), (0, 0, 0), -1)
 
-        cv2.circle(img, (self.cx, self.cy),
-                   max(2, self.radius_to_px(0.5)), (0, 0, 0), -1)
-        hl = min(self.cw, self.ch) // 2
-        cv2.line(img, (self.cx - hl, self.cy), (self.cx + hl, self.cy), (40, 40, 45), 1)
-        cv2.line(img, (self.cx, self.cy - hl), (self.cx, self.cy + hl), (40, 40, 45), 1)
+        # Crosshair lines across full canvas (only for single-mark targets)
+        if not mark_offsets:
+            hl = min(self.cw, self.ch) // 2
+            cv2.line(img, (self.cx - hl, self.cy), (self.cx + hl, self.cy), (40, 40, 45), 1)
+            cv2.line(img, (self.cx, self.cy - hl), (self.cx, self.cy + hl), (40, 40, 45), 1)
 
         # Approach zone boundary (2× scoring radius) — dashed grey circle
         approach_r = self.radius_to_px(self.target_cfg["rings_mm"][-1] * 2.0)

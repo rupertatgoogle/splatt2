@@ -89,21 +89,46 @@ def _load_target_csv(path: str) -> dict:
 
     ring_labels = [str(int(s)) if s == int(s) else str(s) for s in scores]
 
+    # ── Multi-mark support ───────────────────────────────────────────────────
+    # mark_count and mark_spacing_mm are optional — single-mark targets omit them.
+    # mark_offsets: list of (x_mm, y_mm) centres relative to sheet centre.
+    # For a 5-mark quincunx at spacing s:
+    #   (-s,-s)  (+s,-s)     (Y+ = down, matching OpenCV)
+    #      (0, 0)
+    #   (-s,+s)  (+s,+s)
+    mark_count = int(meta.get("mark_count", 1))
+    mark_offsets = None   # None = single mark at (0,0)
+    if mark_count > 1:
+        s = float(meta.get("mark_spacing_mm", 75.0))
+        if mark_count == 5:
+            h = s / 2      # half the square side = offset on each axis
+            mark_offsets = [
+                (-h, -h),   # top-left
+                (+h, -h),   # top-right
+                ( 0,  0),   # centre
+                (-h, +h),   # bottom-left
+                (+h, +h),   # bottom-right
+            ]
+        # Future: other mark_count values can be added here
+
     return {
         "name":               meta["name"],
         "key":                meta["key"],
-        "diameter_mm":        outer_dia,          # card outer diameter
-        "rings_mm":           rings_mm,           # visual ring radii (display only)
-        "ring_scores":        scores,             # visual ring integer scores
+        "diameter_mm":        outer_dia,
+        "rings_mm":           rings_mm,
+        "ring_scores":        scores,
         "gauging":            meta.get("gauging", "outward"),
-        "calibre_mm":         float(meta.get("calibre_mm", 4.5)),   # default pellet dia
+        "calibre_mm":         float(meta.get("calibre_mm", 4.5)),
         "reference_dist_m":   float(meta.get("reference_dist_m", 10.0)),
         "aiming_mark_dia_mm": aiming_dia,
         "outer_ring_dia_mm":  outer_dia,
-        "rings_dia_mm":       unique_dias,        # for marker sheet guide circles
+        "rings_dia_mm":       unique_dias,
         "ring_labels":        ring_labels,
         "a4_target_width_mm": float(meta.get("a4_target_width_mm",
                                              min(outer_dia * 1.1, 170))),
+        "mark_count":         mark_count,
+        "mark_offsets":       mark_offsets,   # None for single-mark targets
+        "mark_spacing_mm":    float(meta.get("mark_spacing_mm", 0)),
     }
 
 def _load_all_targets() -> dict:

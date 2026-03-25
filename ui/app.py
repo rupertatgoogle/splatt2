@@ -115,6 +115,7 @@ class SplattApp:
         )
         self._zero_mode = False
         self._decimal_scoring = self.cfg.get("decimal_scoring", False)
+        self._zoom_factor      = 1.0   # target canvas zoom (0.3–1.5)
         self._show_acp = True
         self._show_bbox_shots = False
         self._show_bbox_acp = False
@@ -438,6 +439,17 @@ class SplattApp:
             parent, f"↻ {rot}°", self._cycle_rotation)
         self._btn_rotate.pack(side="left", padx=(0, 8), pady=5)
 
+        # Zoom slider
+        tk.Label(parent, text="ZOOM", bg=BG_MID, fg=TEXT_DIM,
+                 font=FL).pack(side="left", padx=(4, 2))
+        self._zoom_var = tk.DoubleVar(value=self._zoom_factor)
+        ttk.Scale(parent, from_=0.3, to=1.5, variable=self._zoom_var,
+                  orient="horizontal", length=80,
+                  command=self._on_zoom_change).pack(side="left", pady=5)
+        self._zoom_lbl = tk.Label(parent, text="1.00×", bg=BG_MID, fg=ACCENT,
+                                   font=("Consolas", 9), width=5)
+        self._zoom_lbl.pack(side="left", padx=(0, 6))
+
         # Mic section
         tk.Label(parent, text="MIC", bg=BG_MID, fg=TEXT_DIM,
                  font=FL).pack(side="left", padx=(6, 2))
@@ -690,10 +702,18 @@ class SplattApp:
     def _register_shot(self, aim_mm, shot_ts: float = None):
         if not self._series_started:
             return
-        R = self._scoring_radius_mm()
-        score, ring = score_shot(aim_mm, R, decimal=self._decimal_scoring)
+        R            = self._scoring_radius_mm()
+        mark_offsets = self.target_cfg.get("mark_offsets")  # None for single-mark
+        score, ring, mark_idx = score_shot(aim_mm, R,
+                                            decimal=self._decimal_scoring,
+                                            mark_offsets=mark_offsets)
+        if score == 0 and self.cfg.get("ignore_misses", False):
+            self.root.after(0, lambda: self._set_status(
+                "Miss ignored (score 0)", TEXT_DIM))
+            return
         shot = self.session.record_shot(aim_mm, score, ring,
-                                         shot_timestamp=shot_ts)
+                                         shot_timestamp=shot_ts,
+                                         mark_index=mark_idx)
         if shot is None:
             self.root.after(0, lambda: self._set_status(
                 "SHOT REJECTED — outside approach zone", ACCENT2))
@@ -701,13 +721,13 @@ class SplattApp:
         import time as _t
         self._last_shot_fired_time = _t.time()
         self._last_shot_info = shot
-        # Announce shot on status bar (runs on main thread via after)
         sc = shot.score
         sc_s = f"{sc:.1f}" if sc != int(sc) else str(int(sc))
         col = GOLD if sc >= 10 else (ACCENT if sc >= 9 else
               TEXT_PRI if sc >= 7 else ACCENT2)
-        self.root.after(0, lambda s=sc_s, c=col, i=shot.index:
-            self._set_status(f"Shot #{i}: {s} pts", c))
+        _lbl = (f"Shot #{shot.index} (mark {mark_idx+1}): {sc_s} pts"
+                if mark_offsets else f"Shot #{shot.index}: {sc_s} pts")
+        self.root.after(0, lambda lbl=_lbl, c=col: self._set_status(lbl, c))
 
     def _apply_zero(self, aim_mm):
         self._zero_offset = (self._zero_offset[0] + aim_mm[0],
@@ -771,7 +791,8 @@ class SplattApp:
                               self.target_cfg.get("calibre_mm", 4.5)))
             self.target_renderer = TargetRenderer((fw, fh), self.target_cfg,
                                                    display_calibre_mm=cal,
-                                                   display_cfg=self._make_display_cfg())
+                                                   display_cfg=self._make_display_cfg(),
+                                                   zoom=self._zoom_factor)
             self._tgt_canvas.delete("ph")
 
         fading = self.session.get_fading_trace()
@@ -924,6 +945,13 @@ class SplattApp:
     # =========================================================================
     # CONTROLS
     # =========================================================================
+
+    def _on_zoom_change(self, val=None):
+        """Zoom slider changed — rebuild renderer at new scale."""
+        self._zoom_factor = round(float(self._zoom_var.get()), 2)
+        if hasattr(self, "_zoom_lbl"):
+            self._zoom_lbl.config(text=f"{self._zoom_factor:.2f}×")
+        self.target_renderer = None   # force rebuild on next frame
 
     def _on_thresh_change(self, val=None):
         v = self._thresh_var.get()
@@ -1243,10 +1271,16 @@ class SplattApp:
         from core.session import APPROACH_ZONE_FACTOR
         factor = float(self.cfg.get("approach_zone_factor",
                                      APPROACH_ZONE_FACTOR))
-        # approach_radius uses the same R as scoring — stays consistent
         R = self._scoring_radius_mm()
-        self.session.scoring_radius_mm  = R
-        self.session.approach_radius_mm = R * factor
+        self.session.scoring_radius_mm = R
+        # For multi-mark targets, the approach zone must cover the furthest mark
+        mark_offsets = self.target_cfg.get("mark_offsets")
+        if mark_offsets:
+            import math as _m
+            max_mark_r = max(_m.sqrt(mx**2 + my**2) for mx, my in mark_offsets)
+            self.session.approach_radius_mm = (R + max_mark_r) * factor
+        else:
+            self.session.approach_radius_mm = R * factor
 
     def _make_display_cfg(self) -> dict:
         """Extract display-relevant keys from cfg for TargetRenderer."""
