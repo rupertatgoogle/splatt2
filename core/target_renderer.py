@@ -217,17 +217,20 @@ class TargetRenderer:
         if len(pts) < 2:
             return
         n = len(pts)
+
+        # Pass renderer params to trace so it can pre-compute colours.
+        # If params changed (user updated colours in settings), trigger
+        # a full recompute; otherwise colours are already cached.
+        params = (self.col_approach, self.col_hold, self.col_preshot,
+                  self.col_final, self.trace_preshot_s, self.trace_final_s)
+        if trace._cache_params != params or len(trace.cached_colours) != n:
+            trace.recompute_colours(*params[:4],
+                                    preshot_s=params[4], final_s=params[5])
+
+        # Draw using cached colours — O(n) pixel ops, zero Python colour math
+        colours = trace.cached_colours
         for i in range(1, n):
-            base_col = trace.colour_for_point(
-                i,
-                col_approach=self.col_approach,
-                col_hold=self.col_hold,
-                col_preshot=self.col_preshot,
-                col_final=self.col_final,
-                preshot_s=self.trace_preshot_s,
-                final_s=self.trace_final_s,
-            )
-            col = tuple(int(c * alpha) for c in base_col)
+            col = tuple(int(c * alpha) for c in colours[i])
             p1 = self.mm_to_px(pts[i - 1].aim_mm)
             p2 = self.mm_to_px(pts[i].aim_mm)
             cv2.line(img, p1, p2, col, width, cv2.LINE_AA)

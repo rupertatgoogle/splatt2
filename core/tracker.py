@@ -60,6 +60,9 @@ class ArucoTracker:
         aruco_dict_name: str = "DICT_4X4_50",
         margin_mm: float = 8.0,
         use_clahe: bool = True,
+        clahe_clip: float = 4.0,
+        marker_count: int = 4,
+        brightness_target: float = 128.0,
     ):
         self.board_width_mm = board_width_mm
         self.board_height_mm = board_height_mm
@@ -77,7 +80,9 @@ class ArucoTracker:
         # Dramatically improves marker detection under uneven indoor lighting
         # with negligible performance cost (~2ms per frame at 480p).
         self.use_clahe = use_clahe
-        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        self.brightness_target = float(brightness_target)
+        self._clahe = cv2.createCLAHE(
+            clipLimit=float(clahe_clip), tileGridSize=(8, 8))
 
         # Known corners of each marker in board-space (mm, origin = board TL)
         # Order within each marker: TL, TR, BR, BL
@@ -86,12 +91,26 @@ class ArucoTracker:
         bw = board_width_mm
         bh = board_height_mm
 
+        # Board corners for each marker ID — extended for 4/6/8 marker layouts.
+        # IDs 0-3: corners (TL, TR, BR, BL)
+        # IDs 4-5: left and right edge midpoints (6-marker layout)
+        # IDs 6-7: top and bottom edge midpoints (8-marker layout)
         self._board_corners = {
-            0: np.array([[mg,    mg   ], [mg+m,  mg   ], [mg+m,  mg+m ], [mg,    mg+m ]], dtype=np.float32),
-            1: np.array([[bw-mg-m, mg ], [bw-mg,  mg  ], [bw-mg, mg+m ], [bw-mg-m, mg+m]], dtype=np.float32),
-            2: np.array([[bw-mg-m, bh-mg-m], [bw-mg, bh-mg-m], [bw-mg, bh-mg], [bw-mg-m, bh-mg]], dtype=np.float32),
-            3: np.array([[mg, bh-mg-m], [mg+m, bh-mg-m], [mg+m, bh-mg], [mg, bh-mg]], dtype=np.float32),
+            0: np.array([[mg,       mg      ], [mg+m,    mg      ], [mg+m,    mg+m   ], [mg,      mg+m   ]], dtype=np.float32),
+            1: np.array([[bw-mg-m,  mg      ], [bw-mg,   mg      ], [bw-mg,   mg+m   ], [bw-mg-m, mg+m   ]], dtype=np.float32),
+            2: np.array([[bw-mg-m,  bh-mg-m ], [bw-mg,   bh-mg-m], [bw-mg,   bh-mg  ], [bw-mg-m, bh-mg  ]], dtype=np.float32),
+            3: np.array([[mg,       bh-mg-m ], [mg+m,    bh-mg-m], [mg+m,    bh-mg  ], [mg,      bh-mg  ]], dtype=np.float32),
+            # 6-marker: left and right edge midpoints (matches printed sheet)
+            4: np.array([[mg,       bh/2-m/2], [mg+m,    bh/2-m/2], [mg+m,    bh/2+m/2], [mg,      bh/2+m/2]], dtype=np.float32),
+            5: np.array([[bw-mg-m,  bh/2-m/2], [bw-mg,   bh/2-m/2], [bw-mg,   bh/2+m/2], [bw-mg-m, bh/2+m/2]], dtype=np.float32),
+            # 8-marker: top and bottom edge midpoints (matches printed sheet)
+            6: np.array([[bw/2-m/2, mg      ], [bw/2+m/2, mg      ], [bw/2+m/2, mg+m   ], [bw/2-m/2, mg+m  ]], dtype=np.float32),
+            7: np.array([[bw/2-m/2, bh-mg-m ], [bw/2+m/2, bh-mg-m], [bw/2+m/2, bh-mg  ], [bw/2-m/2, bh-mg ]], dtype=np.float32),
         }
+        # Restrict to the active marker count
+        active_ids = {4: [0,1,2,3], 6: [0,1,2,3,4,5], 8: [0,1,2,3,4,5,6,7]}
+        keep = active_ids.get(marker_count, [0,1,2,3])
+        self._board_corners = {k: v for k, v in self._board_corners.items() if k in keep}
 
         # Target centre in board-space (mm) — exactly the centre of the board
         self.target_centre_mm = np.array([bw / 2, bh / 2], dtype=np.float32)
@@ -102,13 +121,25 @@ class ArucoTracker:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def _make_empty_result(self) -> "TrackFrame":
+        r = TrackFrame()
+        return r
+
     def process_frame(self, frame: np.ndarray) -> TrackFrame:
         result = TrackFrame()
         result.frame_display = frame.copy()
 
-        # Pre-process: convert to greyscale and optionally apply CLAHE
+        # Pre-process: greyscale → software gain normalisation → CLAHE
+        # Gain normalisation scales brightness to a fixed target regardless of
+        # ambient light changes (clouds, time of day). Operates entirely in
+        # Python — no driver cooperation needed.
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self.use_clahe:
+            mean = float(np.mean(gray))
+            if mean > 1.0:
+                scale = self.brightness_target / mean
+                gray = np.clip(gray.astype(np.float32) * scale,
+                               0, 255).astype(np.uint8)
             gray = self._clahe.apply(gray)
         corners, ids, rejected = self.detector.detectMarkers(gray)
 
@@ -152,7 +183,7 @@ class ArucoTracker:
         self._last_homography = H
         self._homography_age = 0
         result.homography = H
-        result.quality = min(1.0, len(img_pts) / 4.0)
+        result.quality = min(1.0, len(img_pts) / len(self._board_corners))
 
         self._compute_aim(result, frame)
         return result

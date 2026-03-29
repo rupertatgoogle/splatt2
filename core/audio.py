@@ -46,7 +46,7 @@ class AudioDetector:
         transient_ratio: float = 6.0,
         cooldown_ms: int = 800,
         sample_rate: int = 44100,
-        chunk_size: int = 2205,           # ~50ms chunks for responsiveness
+        chunk_size: int = 512,            # ~12ms chunks — low latency transient detection
         device_index: Optional[int] = None,
         on_shot: Optional[Callable] = None,
     ):

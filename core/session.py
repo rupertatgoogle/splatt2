@@ -67,6 +67,11 @@ class ShotTrace:
     points: List[TracePoint] = field(default_factory=list)
     fired_time: Optional[float] = None
     state: str = "active"
+    # Pre-computed colours — one entry per point, updated at append time.
+    # Avoids recalculating colour_for_point() for every point on every frame.
+    cached_colours: List[Tuple[int,int,int]] = field(default_factory=list)
+    # Renderer params used for the cache — stored so we can detect changes
+    _cache_params: Optional[tuple] = field(default=None, repr=False)
 
     # ── Accessors ─────────────────────────────────────────────────────────────
 
@@ -103,6 +108,42 @@ class ShotTrace:
         pts = pts[-n:]
         return (float(np.mean([p.aim_mm[0] for p in pts])),
                 float(np.mean([p.aim_mm[1] for p in pts])))
+
+    def recompute_colours(
+        self,
+        col_approach, col_hold, col_preshot, col_final,
+        preshot_s: float = 1.0,
+        final_s: float = 0.2,
+        tail_only: bool = False,
+    ):
+        """
+        (Re)compute cached_colours for all or just the tail of the trace.
+        Call with tail_only=True after fired_time is set — only the last
+        few seconds of points change colour on firing, the rest stay the same.
+        """
+        params = (col_approach, col_hold, col_preshot, col_final,
+                  preshot_s, final_s)
+        n = len(self.points)
+        if not self.cached_colours or len(self.cached_colours) != n:
+            tail_only = False  # full recompute if lengths mismatch
+
+        if tail_only and self.fired_time is not None:
+            # Only recompute points within preshot_s + 0.5s of fired_time
+            recompute_from = 0
+            for i in range(n - 1, -1, -1):
+                if self.fired_time - self.points[i].timestamp > preshot_s + 0.5:
+                    recompute_from = i
+                    break
+            indices = range(recompute_from, n)
+        else:
+            self.cached_colours = [None] * n
+            indices = range(n)
+
+        for i in indices:
+            self.cached_colours[i] = self.colour_for_point(
+                i, col_approach, col_hold, col_preshot, col_final,
+                preshot_s, final_s)
+        self._cache_params = params
 
     def colour_for_point(
         self, idx: int,
@@ -348,6 +389,16 @@ class Session:
             zone = ZONE_ON_TARGET if on_target else ZONE_APPROACH
             self.active_trace.points.append(
                 TracePoint(timestamp=time.time(), aim_mm=aim_mm, zone=zone))
+            # Pre-compute colour for new point using cached renderer params.
+            # Falls back to a default if params not yet set (first frame).
+            cp = self.active_trace._cache_params
+            if cp:
+                col = self.active_trace.colour_for_point(
+                    len(self.active_trace.points) - 1, *cp[:4],
+                    preshot_s=cp[4], final_s=cp[5])
+            else:
+                col = (80, 190, 40)   # default green until params arrive
+            self.active_trace.cached_colours.append(col)
         else:
             if self._in_approach_zone:
                 self._in_approach_zone = False
@@ -363,6 +414,7 @@ class Session:
         ring_index: int,
         shot_timestamp: Optional[float] = None,
         mark_index: int = 0,
+        defer_write: bool = False,
     ) -> Optional[Shot]:
         """
         Register a shot.
@@ -410,6 +462,13 @@ class Session:
         trace = self.active_trace
         trace.fired_time = shot_timestamp or time.time()
         trace.state = "fired"
+        # Recompute only the tail of the cached colours — the preshot/final
+        # colour zones only affect the last ~1-2 seconds before the shot.
+        # The bulk of the trace (hold zone) is already correctly cached.
+        if trace._cache_params:
+            cp = trace._cache_params
+            trace.recompute_colours(*cp[:4], preshot_s=cp[4], final_s=cp[5],
+                                    tail_only=True)
 
         shot = Shot(
             index=self._shot_counter,
@@ -424,8 +483,8 @@ class Session:
         )
         self.shots.append(shot)
 
-        # Write to live file immediately
-        if self._writer and self._writer.is_open:
+        # Write to live file immediately (unless caller wants to rescore first)
+        if not defer_write and self._writer and self._writer.is_open:
             try:
                 self._writer.write_shot(shot)
             except Exception as e:

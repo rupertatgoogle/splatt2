@@ -6,7 +6,7 @@ All user-configurable settings and target definitions.
 import json
 import os
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 def _config_path() -> str:
     """Config file lives in the project root (next to main.py)."""
@@ -171,9 +171,15 @@ DEFAULT_CONFIG = {
     "flip_mode":       -1,
     "no_video_mode":   False,   # skip camera preview (faster on slow machines)
     "use_clahe":       True,    # adaptive contrast enhancement for ArUco detection
+    "clahe_clip":      4.0,     # CLAHE clip limit (2=mild, 4=moderate, 8=aggressive)
+    "brightness_target": 128.0, # software gain target brightness (0-255, 128=mid)
+    "spike_velocity_mm":  25.0, # min mm/frame for spike candidate
+    "spike_reversal":     0.7,  # min reversal ratio to confirm spike (0-1)
 
     # ── ArUco tracking ───────────────────────────────────────────────────────
     "aruco_dict":       "DICT_4X4_50",
+    "aruco_marker_count": 4,        # number of ArUco markers: 4, 6, or 8
+    "camera_pixel_format": "Auto",  # Auto / MJPEG / YUY2
     "aruco_marker_mm":  40.0,   # printed size of each ArUco marker (mm)
     "aruco_margin_mm":  8.0,    # margin from sheet edge to marker corner (mm)
 

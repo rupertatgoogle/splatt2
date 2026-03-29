@@ -72,6 +72,7 @@ def generate_marker_sheet(
     aruco_dict_name: str = "DICT_4X4_50",
     marker_size_mm: float = None,         # None = use MARKER_MM default (40mm)
     margin_mm: float = None,              # None = use MARGIN_MM default (8mm)
+    marker_count: int = 4,               # 4 / 6 / 8 markers on the sheet
 ) -> str:
     """
     Generate and save the ArUco marker sheet.
@@ -105,7 +106,16 @@ def generate_marker_sheet(
         2: (A4_W_PX - margin_px - marker_px,  A4_H_PX - margin_px - marker_px),
         3: (margin_px,                        A4_H_PX - margin_px - marker_px),
     }
-    labels = {0: "TL(0)", 1: "TR(1)", 2: "BR(2)", 3: "BL(3)"}
+    # Extended positions for 6 and 8 marker layouts
+    if marker_count >= 6:
+        positions[4] = (margin_px, A4_H_PX // 2 - marker_px // 2)
+        positions[5] = (A4_W_PX - margin_px - marker_px, A4_H_PX // 2 - marker_px // 2)
+    if marker_count >= 8:
+        positions[6] = (A4_W_PX // 2 - marker_px // 2, margin_px)
+        positions[7] = (A4_W_PX // 2 - marker_px // 2, A4_H_PX - margin_px - marker_px)
+
+    labels = {0: "TL(0)", 1: "TR(1)", 2: "BR(2)", 3: "BL(3)",
+              4: "LM(4)", 5: "RM(5)", 6: "TM(6)", 7: "BM(7)"}
     for mid, (x, y) in positions.items():
         mimg = cv2.aruco.generateImageMarker(aruco_dict, mid, marker_px)
         b = 4
@@ -163,7 +173,7 @@ def generate_marker_sheet(
     # ── Print instructions ────────────────────────────────────────────────────
     instr_lines = [
         f"SPLATT2  —  {mark_cfg['name']}",
-        f"Print distance: {dist:.1f}m  |  Scale: {scale_pct*100:.0f}%  |  "
+        f"Print distance: {dist:.1f}m  |  Scale: {scale_pct*100:.0f}%  |  Markers: {marker_count}  |  "
         f"Aiming mark: {aiming_dia_scaled:.1f}mm  |  Card: {outer_dia_scaled:.1f}mm  |  Markers: {_marker:.0f}mm",
         "Print at 100% on A4 — NO fit-to-page scaling.",
         "Verify printed aiming mark diameter with ruler before use.",

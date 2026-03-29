@@ -10,7 +10,7 @@ No special hardware required — just a webcam, a microphone, a printer, and a c
 
 1. Print the **ArUco marker sheet** from within the app and stick it behind your target.
 2. Mount a small USB webcam to your rifle so the lens points at the target.
-3. Start Splatt2 — it detects the four corner markers and establishes a live millimetre-accurate coordinate system.
+3. Start Splatt2 — it detects ArUco markers on the sheet (4, 6, or 8 depending on your setup) and establishes a live millimetre-accurate coordinate system.
 4. As you aim, a crosshair tracks your hold on the digital target in real time.
 5. When a shot fires (air-gun click detected by microphone), the position at the **exact moment of audio detection** is recorded — not the position when the software processes it, eliminating software lag.
 6. The shot is scored and displayed instantly.
@@ -117,7 +117,13 @@ For fine adjustment after a sighting string:
 ## The Interface
 
 ### Left panel — Camera
-Live camera feed with detected markers highlighted and the aim-point crosshair overlaid. The tracking quality bar shows how many markers are visible:
+Live camera feed with detected markers highlighted and the aim-point crosshair overlaid. The actual delivered FPS is shown in the top-left corner of the feed.
+
+Below the feed: a **◎ Focus assist** toggle (for manual-focus lenses) that reveals a live sharpness bar with peak-hold indicator — turn the focus ring until the bar peaks and shows green, then lock focus. Zero CPU cost when off.
+
+The **🎛 Cam Props** button (next to Settings) opens the Windows native camera properties dialog where you can adjust brightness, contrast, saturation, sharpness, and exposure directly via the driver. Increasing contrast and sharpness in this dialog significantly improves ArUco detection.
+
+The tracking quality bar shows what fraction of configured markers are visible:
 - **Green (>60%)** — all or most markers detected, full accuracy
 - **Yellow (30–60%)** — partial detection, homography being reused
 - **Red (<30%)** — tracking lost, shots will be rejected
@@ -161,6 +167,10 @@ Left to right: Pause, Zero, Fine Zero, decimal scoring toggle (DEC), camera rota
 | ArUco Dictionary | DICT_4X4_50 works well for most setups; must match the printed sheet |
 | Marker size / Margin | Must match the values used when printing the sheet |
 | CLAHE | Adaptive contrast enhancement — improves tracking under uneven lighting (recommended ON) |
+| CLAHE clip limit | Aggressiveness of contrast enhancement (2=mild, 4=balanced, 8=aggressive, 12=extreme). Quick buttons in Settings. |
+| Brightness target | Software gain normalisation target (0–255). Frame brightness is scaled to this value before CLAHE, compensating automatically for lighting changes. Default 128. |
+| Marker count | 4 / 6 / 8 ArUco markers. More markers improve robustness when one is briefly occluded. Must match the printed sheet. |
+| Pixel format | Auto / MJPEG / YUY2. MJPEG prevents fps throttling on static scenes on some cameras. |
 | Smoothing | EMA (fast) or Savitzky-Golay (smoother shape) — affects trace appearance only, not shot position |
 
 ### Audio
@@ -192,6 +202,12 @@ All trace and shot colours are fully configurable. Changes apply on **Apply** wi
 | Approach zone | How far outside the target the software tracks approach (× scoring radius) |
 | Pre-shot window | How many seconds before the shot the trace turns yellow |
 | Final window | How many seconds before the shot the trace turns red |
+
+### Spike Filter (Settings → Camera)
+| Setting | Description |
+|---------|-------------|
+| Spike velocity (mm/frame) | Minimum speed to flag a position as a spike candidate. Lower = more sensitive. Default 25mm/frame. |
+| Reversal ratio (0–1) | How sharply the direction must reverse to confirm a spike. 0.7 = default. 0.9 = strict. |
 
 ---
 
@@ -257,11 +273,13 @@ Each `.csv` has a companion `.json` file with full trace data for the Series Rev
 ## Troubleshooting
 
 **Tracking quality is 0% / no markers detected**
-- Check that all four markers are visible in the camera frame
+- Check that all configured markers are visible in the camera frame
 - Improve lighting — ArUco detection needs good contrast (avoid glare on the sheet)
-- Enable CLAHE in Settings → Camera (helps with uneven indoor lighting)
+- Enable CLAHE in Settings → Camera and raise the clip limit (try 6 or 8 for difficult lighting)
+- Use 🎛 Cam Props to boost contrast and sharpness in the camera driver — this often helps significantly
 - Make sure the printed sheet is flat and undamaged
 - Verify the ArUco dictionary in Settings matches the one used to print the sheet
+- Verify the marker count in Settings matches the number of markers on the sheet
 
 **Shots not registering / "SHOT REJECTED"**
 - "No tracking" — camera can't see markers when the shot fired; reposition
@@ -314,6 +332,10 @@ splatt2/
 ```
 
 ---
+
+## Changelog
+
+See `CHANGELOG.md` for a full history of changes since the initial release.
 
 ## Contributing
 

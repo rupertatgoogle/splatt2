@@ -86,9 +86,13 @@ class SplattApp:
         )
         self._apply_session_cfg()  # wire cfg into session at startup
         self.tracker = ArucoTracker(
-            aruco_dict_name=self.cfg["aruco_dict"],
+            aruco_dict_name=self.cfg.get("aruco_dict", "DICT_4X4_50"),
             marker_size_mm=float(self.cfg.get("aruco_marker_mm", 40.0)),
             margin_mm=float(self.cfg.get("aruco_margin_mm", 8.0)),
+            use_clahe=bool(self.cfg.get("use_clahe", True)),
+            clahe_clip=float(self.cfg.get("clahe_clip", 4.0)),
+            marker_count=int(self.cfg.get("aruco_marker_count", 4)),
+            brightness_target=float(self.cfg.get("brightness_target", 128.0)),
         )
         self.target_renderer = None
 
@@ -97,7 +101,7 @@ class SplattApp:
             transient_ratio=self.cfg.get("audio_transient_ratio", 6.0),
             cooldown_ms=self.cfg.get("audio_trigger_cooldown_ms", 800),
             sample_rate=self.cfg.get("audio_sample_rate", 44100),
-            chunk_size=2205,
+            chunk_size=512,          # ~12ms chunks — low latency, still enough for transient detection
             device_index=self.cfg.get("audio_device_index"),
             on_shot=self._on_shot_detected,
         )
@@ -107,7 +111,10 @@ class SplattApp:
         self._running = False
         self._paused = False
         self._shot_queue = queue.Queue()
-        self._current_aim_mm = None
+        self._current_aim_mm  = None
+        self._raw_aim_prev     = None   # previous raw position (pre-smoother)
+        self._raw_aim_prev2    = None   # two frames ago (for velocity reversal)
+        self._spike_hold       = None   # buffered position during spike candidate
         self._tracking_quality = 0.0
         self._zero_offset = (
             float(self.cfg.get("zero_offset_x", 0.0)),
@@ -116,6 +123,10 @@ class SplattApp:
         self._zero_mode = False
         self._decimal_scoring = self.cfg.get("decimal_scoring", False)
         self._zoom_factor      = 1.0   # target canvas zoom (0.3–1.5)
+        self._live_fps         = 0.0   # measured camera FPS
+        self._sharpness        = 0.0   # Laplacian variance (focus measure)
+        self._sharpness_peak   = 0.0   # peak hold
+        self._sharpness_peak_t = 0.0   # time of peak
         self._show_acp = True
         self._show_bbox_shots = False
         self._show_bbox_acp = False
@@ -230,6 +241,28 @@ class SplattApp:
                                    fg=TEXT_DIM, font=FH)
         self._cam_label.pack(fill="both", expand=True, padx=6, pady=4)
 
+        # Focus sharpness — toggle button + collapsible bar
+        self._focus_active = False
+        ff_btn = tk.Frame(parent, bg=BG_PANEL)
+        ff_btn.pack(fill="x", padx=6, pady=(0, 2))
+        self._btn_focus = tk.Button(ff_btn, text="◎ Focus assist: OFF",
+                                     command=self._toggle_focus_assist,
+                                     bg=BG_CARD, fg=TEXT_DIM, font=FL,
+                                     relief="flat", padx=6, pady=2, cursor="hand2")
+        self._btn_focus.pack(side="left")
+
+        self._focus_frame = tk.Frame(parent, bg=BG_PANEL)
+        # Not packed yet — shown only when active
+        tk.Label(self._focus_frame, text="FOCUS", bg=BG_PANEL,
+                 fg=TEXT_DIM, font=FL).pack(side="left")
+        self._sharpness_var = tk.DoubleVar()
+        ttk.Progressbar(self._focus_frame, variable=self._sharpness_var,
+                        maximum=100, length=140,
+                        style="Quality.Horizontal.TProgressbar").pack(side="left", padx=4)
+        self._focus_lbl = tk.Label(self._focus_frame, text="—", bg=BG_PANEL,
+                                    fg=ACCENT, font=("Consolas", 9), width=12)
+        self._focus_lbl.pack(side="left")
+
         # Tracking quality bar
         qf = tk.Frame(parent, bg=BG_PANEL)
         qf.pack(fill="x", padx=6, pady=(0, 2))
@@ -256,6 +289,7 @@ class SplattApp:
         self._btn_cam = _mk_btn(cf, "▶  Start Camera", self._start_camera, accent=True)
         self._btn_cam.pack(side="left")
         _mk_btn(cf, "⚙  Settings", self._open_settings).pack(side="right")
+        _mk_btn(cf, "🎛  Cam Props", self._open_camera_properties).pack(side="right", padx=4)
 
     # ── Target panel ──────────────────────────────────────────────────────────
     def _build_target_panel(self, parent):
@@ -571,6 +605,17 @@ class SplattApp:
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         self._cap.set(cv2.CAP_PROP_FPS, target_fps)
+        # Pixel format — MJPEG prevents static-scene frame rate throttling
+        _fmt = self.cfg.get("camera_pixel_format", "Auto")
+        if _fmt == "MJPEG":
+            _accepted = self._cap.set(cv2.CAP_PROP_FOURCC,
+                                      cv2.VideoWriter.fourcc('M','J','P','G'))
+            _rb = int(self._cap.get(cv2.CAP_PROP_FOURCC))
+            _rb_str = ''.join([chr((_rb >> (8*i)) & 0xFF) for i in range(4)])
+            print(f"[Camera] MJPEG requested — fourcc readback: {_rb_str!r}")
+        elif _fmt == "YUY2":
+            self._cap.set(cv2.CAP_PROP_FOURCC,
+                          cv2.VideoWriter.fourcc('Y','U','Y','2'))
         # Minimise buffer — always get freshest frame, never queue up stale ones
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
@@ -591,6 +636,8 @@ class SplattApp:
         self._btn_cam.config(text="▶  Start Camera", bg=BG_CARD, fg=TEXT_SEC)
         self._set_status("STOPPED", TEXT_DIM)
 
+
+
     def _camera_loop(self):
         """
         Optimised camera loop:
@@ -606,6 +653,11 @@ class SplattApp:
         detect_w   = 640      # ArUco detection width (never larger than capture)
         detect_h   = 480
 
+        # Live FPS measurement
+        _fps_frame_count = 0
+        _fps_last_time   = time.time()
+        _fps_display     = 0.0
+
         while self._running:
             if not self._cap or not self._cap.isOpened():
                 break
@@ -613,6 +665,7 @@ class SplattApp:
             if not ret:
                 time.sleep(0.005)
                 continue
+
 
             if self.cfg.get("flip_image"):
                 frame = cv2.flip(frame, self.cfg.get("flip_mode", -1))
@@ -636,6 +689,13 @@ class SplattApp:
             else:
                 small = frame
 
+            # Laplacian variance — only computed when focus assist is on
+            if self._focus_active:
+                _lap = cv2.Laplacian(small if len(small.shape)==2
+                                     else cv2.cvtColor(small, cv2.COLOR_BGR2GRAY),
+                                     cv2.CV_64F)
+                self._sharpness = float(_lap.var())
+
             result = self.tracker.process_frame(small)
             self._tracking_quality = result.quality
             self._current_markers_found = result.markers_found
@@ -645,16 +705,69 @@ class SplattApp:
                 zeroed = (raw[0] - self._zero_offset[0],
                           raw[1] - self._zero_offset[1])
                 if result.quality >= 0.25:
-                    smoothed = self._smoother.update(zeroed)
+                    # ── Velocity spike filter (raw positions, pre-smoother) ──
+                    # Detects bad homography spikes: a large jump that immediately
+                    # reverses. Genuine fast movement (recoil, swing) continues
+                    # in the same direction — it does not sharply reverse.
+                    filtered = zeroed
+                    if self._raw_aim_prev is not None:
+                        import math as _m
+                        spk_vel  = float(self.cfg.get("spike_velocity_mm", 25.0))
+                        spk_rev  = float(self.cfg.get("spike_reversal", 0.7))
+                        px, py   = self._raw_aim_prev
+                        vx = zeroed[0] - px
+                        vy = zeroed[1] - py
+                        speed = _m.sqrt(vx*vx + vy*vy)
+                        if speed > spk_vel and self._raw_aim_prev2 is not None:
+                            # Check if previous frame also had a large jump
+                            # and this frame reverses it
+                            p2x, p2y = self._raw_aim_prev2
+                            v2x = px - p2x
+                            v2y = py - p2y
+                            dot = vx*v2x + vy*v2y
+                            mag2 = _m.sqrt(v2x*v2x + v2y*v2y)
+                            if mag2 > spk_vel and dot < -spk_rev * speed * mag2:
+                                # Sharp reversal detected — this frame is the
+                                # return from a spike. Discard both spike frames.
+                                filtered = self._raw_aim_prev2
+                                self._raw_aim_prev  = self._raw_aim_prev2
+                    self._raw_aim_prev2 = self._raw_aim_prev
+                    self._raw_aim_prev  = zeroed
+                    smoothed = self._smoother.update(filtered)
                     self._current_aim_mm = smoothed
                     in_appr, on_tgt = self.session.update_aim(smoothed)
                     self._in_approach_zone = in_appr
                     self._on_target_status = on_tgt
 
+            # Measure actual delivered FPS
+            _fps_frame_count += 1
+            _fps_now = time.time()
+            _fps_elapsed = _fps_now - _fps_last_time
+            if _fps_elapsed >= 0.5:   # update every half second
+                _fps_display     = _fps_frame_count / _fps_elapsed
+                _fps_frame_count = 0
+                _fps_last_time   = _fps_now
+            self._live_fps = _fps_display
+            # Update sharpness peak hold (only when focus assist is on)
+            if self._focus_active:
+                _now = time.time()
+                if self._sharpness >= self._sharpness_peak:
+                    self._sharpness_peak   = self._sharpness
+                    self._sharpness_peak_t = _now
+                elif _now - self._sharpness_peak_t > 3.0:
+                    self._sharpness_peak = self._sharpness
+
             # Only update UI preview every N frames and not in no_video mode
             ui_counter += 1
             if not no_video and ui_counter >= ui_every:
-                self._latest_cam_frame = result.frame_display
+                # Overlay FPS on the camera frame
+                disp = result.frame_display.copy() if result.frame_display is not None else None
+                if disp is not None:
+                    fps_txt = f"{_fps_display:.1f} fps"
+                    cv2.putText(disp, fps_txt, (6, 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                                (80, 220, 80), 1, cv2.LINE_AA)
+                    self._latest_cam_frame = disp
                 ui_counter = 0
 
             try:
@@ -704,16 +817,39 @@ class SplattApp:
             return
         R            = self._scoring_radius_mm()
         mark_offsets = self.target_cfg.get("mark_offsets")  # None for single-mark
-        score, ring, mark_idx = score_shot(aim_mm, R,
+
+        # Step 1: record the shot — this does the retroactive position lookup,
+        # correcting aim_mm to where the crosshair actually was at shot_ts.
+        # We pass a placeholder score of 0.0 and rescore after using the
+        # corrected position, so scoring and drawing use identical coordinates.
+        shot = self.session.record_shot(aim_mm, 0.0, 0,
+                                         shot_timestamp=shot_ts,
+                                         mark_index=0,
+                                         defer_write=True)
+        if shot is None:
+            self.root.after(0, lambda: self._set_status(
+                "SHOT REJECTED — outside approach zone", ACCENT2))
+            return
+
+        # Step 2: score from the retroactively corrected position
+        score, ring, mark_idx = score_shot(shot.aim_mm, R,
                                             decimal=self._decimal_scoring,
                                             mark_offsets=mark_offsets)
+
+        # Step 3: update the shot with the correct score and mark
+        shot.score      = score
+        shot.ring_index = ring
+        shot.mark_index = mark_idx
+
+        # Step 4: rewrite the live CSV row with the correct score
+        if self.session._writer and self.session._writer.is_open:
+            self.session._writer.write_shot(shot)
+
         if score == 0 and self.cfg.get("ignore_misses", False):
+            self.session.shots.remove(shot)
             self.root.after(0, lambda: self._set_status(
                 "Miss ignored (score 0)", TEXT_DIM))
             return
-        shot = self.session.record_shot(aim_mm, score, ring,
-                                         shot_timestamp=shot_ts,
-                                         mark_index=mark_idx)
         if shot is None:
             self.root.after(0, lambda: self._set_status(
                 "SHOT REJECTED — outside approach zone", ACCENT2))
@@ -728,6 +864,22 @@ class SplattApp:
         _lbl = (f"Shot #{shot.index} (mark {mark_idx+1}): {sc_s} pts"
                 if mark_offsets else f"Shot #{shot.index}: {sc_s} pts")
         self.root.after(0, lambda lbl=_lbl, c=col: self._set_status(lbl, c))
+
+
+    def _open_camera_properties(self):
+        """Open Windows DirectShow camera properties dialog.
+        Adjust brightness, contrast, saturation, sharpness, hue,
+        gamma, white balance. Start the camera first.
+        """
+        if self._cap is None or not self._cap.isOpened():
+            messagebox.showinfo("Camera Properties",
+                "Start the camera first, then open Camera Properties.")
+            return
+        try:
+            self._cap.set(cv2.CAP_PROP_SETTINGS, 1)
+        except Exception as e:
+            messagebox.showerror("Camera Properties",
+                f"Could not open properties dialog:\n{e}")
 
     def _apply_zero(self, aim_mm):
         self._zero_offset = (self._zero_offset[0] + aim_mm[0],
@@ -778,6 +930,21 @@ class SplattApp:
         if self._current_aim_mm:
             x, y = self._current_aim_mm
             self._aim_lbl.config(text=f"Aim: ({x:+.1f}, {y:+.1f}) mm")
+
+        # Sharpness / focus bar (only when active)
+        if self._focus_active and hasattr(self, "_sharpness_var") and self._sharpness > 0:
+            # Normalise: Laplacian variance is unbounded; use peak as 100%
+            # Cap at 5× the rolling peak so the bar doesn't stay pegged at 0
+            peak = max(self._sharpness_peak, 1.0)
+            norm = min(100.0, self._sharpness / peak * 100.0)
+            self._sharpness_var.set(norm)
+            # Colour: green when near peak, amber when dropping, dim when far off
+            at_peak = (self._sharpness >= self._sharpness_peak * 0.97)
+            near    = (self._sharpness >= self._sharpness_peak * 0.90)
+            fc = ACCENT if at_peak else (GOLD if near else TEXT_DIM)
+            peak_txt = "PEAK" if at_peak else f"pk:{self._sharpness_peak:.0f}"
+            self._focus_lbl.config(
+                text=f"{norm:4.0f}% {peak_txt}", fg=fc)
 
     def _update_target_display(self):
         fw = self._tgt_canvas.winfo_width()
@@ -945,6 +1112,28 @@ class SplattApp:
     # =========================================================================
     # CONTROLS
     # =========================================================================
+
+    def _on_exp_mode(self):
+        """Auto exposure checkbox changed — apply live."""
+        if hasattr(self, '_exp_auto_var'):
+            self.cfg["camera_auto_exposure"] = self._exp_auto_var.get()
+
+    def _toggle_focus_assist(self):
+        """Toggle focus sharpness meter on/off."""
+        self._focus_active = not self._focus_active
+        if self._focus_active:
+            # Reset peak so it builds fresh from current focus position
+            self._sharpness_peak   = 0.0
+            self._sharpness_peak_t = 0.0
+            self._sharpness        = 0.0
+            self._focus_frame.pack(fill="x", padx=6, pady=(0, 2),
+                                   after=self._btn_focus.master)
+            self._btn_focus.config(text="◎ Focus assist: ON", fg=ACCENT, bg=BG_MID)
+        else:
+            self._focus_frame.pack_forget()
+            self._sharpness_var.set(0)
+            self._focus_lbl.config(text="—", fg=TEXT_DIM)
+            self._btn_focus.config(text="◎ Focus assist: OFF", fg=TEXT_DIM, bg=BG_CARD)
 
     def _on_zoom_change(self, val=None):
         """Zoom slider changed — rebuild renderer at new scale."""
@@ -1231,13 +1420,16 @@ class SplattApp:
         self._smoother.reset()
 
         # Rebuild tracker if marker size changed
-        marker_keys = {"aruco_marker_mm", "aruco_margin_mm", "aruco_dict", "use_clahe"}
+        marker_keys = {"aruco_marker_mm", "aruco_margin_mm", "aruco_dict", "use_clahe", "clahe_clip", "aruco_marker_count", "brightness_target"}
         if any(new_cfg.get(k) != self.cfg.get(k) for k in marker_keys):
             self.tracker = ArucoTracker(
                 aruco_dict_name=self.cfg["aruco_dict"],
                 marker_size_mm=float(self.cfg.get("aruco_marker_mm", 40.0)),
                 margin_mm=float(self.cfg.get("aruco_margin_mm", 8.0)),
                 use_clahe=bool(self.cfg.get("use_clahe", True)),
+                clahe_clip=float(self.cfg.get("clahe_clip", 4.0)),
+                marker_count=int(self.cfg.get("aruco_marker_count", 4)),
+                brightness_target=float(self.cfg.get("brightness_target", 128.0)),
             )
 
         # Rotation — applies immediately to camera loop
@@ -1802,6 +1994,17 @@ class MarkerSheetDialog(tk.Toplevel):
         tk.Label(r6, text="  (must match Settings → Camera)",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
+        r8 = tk.Frame(parent, bg=BG_DARK); r8.pack(fill="x", **pad)
+        tk.Label(r8, text="Marker count:", bg=BG_DARK, fg=TEXT_SEC,
+                 font=FB, width=22, anchor="w").pack(side="left")
+        self._sheet_marker_count = tk.StringVar(
+            value=str(self.cfg.get("aruco_marker_count", 4)))
+        ttk.Combobox(r8, textvariable=self._sheet_marker_count,
+                     values=["4", "6", "8"], state="readonly",
+                     width=6, font=FL).pack(side="left")
+        tk.Label(r8, text="  must match Settings → Camera → Marker count",
+                 bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
+
         r3 = tk.Frame(parent, bg=BG_DARK); r3.pack(fill="x", **pad)
         tk.Label(r3, text="Show ring guides:", bg=BG_DARK, fg=TEXT_SEC,
                  font=FB, width=22, anchor="w").pack(side="left")
@@ -1872,7 +2075,8 @@ class MarkerSheetDialog(tk.Toplevel):
                                show_ring_guides=self._rvar.get(),
                                aruco_dict_name=self._dictvar.get(),
                                marker_size_mm=marker_sz,
-                               margin_mm=margin_sz)
+                               margin_mm=margin_sz,
+                               marker_count=int(self._sheet_marker_count.get()))
         try:
             os.startfile(out)
         except Exception:
@@ -2386,7 +2590,6 @@ class SettingsDialog(tk.Toplevel):
         # Notebook fills the rest
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
-
         for name, builder in [("Camera",   self._build_cam),
                                ("Audio",    self._build_audio),
                                ("Target",   self._build_target),
@@ -2423,6 +2626,8 @@ class SettingsDialog(tk.Toplevel):
                          c.unbind_all("<MouseWheel>"))
 
             builder(inner)
+            # Force scroll region now that content is populated
+            self.after(50, _refresh)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -2488,7 +2693,7 @@ class SettingsDialog(tk.Toplevel):
         self._v_video_fps = tk.StringVar(value=str(self.cfg.get("video_fps", 30)))
         tk.Entry(r2, textvariable=self._v_video_fps, width=5, bg=BG_CARD,
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat", font=FM).pack(side="left")
-        for fps in [30, 60]:
+        for fps in [30, 60, 120]:
             tk.Button(r2, text=str(fps),
                       command=lambda f=fps: self._v_video_fps.set(str(f)),
                       bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
@@ -2537,6 +2742,30 @@ class SettingsDialog(tk.Toplevel):
         self._note(tab, "Larger markers → better detection at low resolution.\n"
                         "Default 40mm with 8mm margin leaves 114mm centre space.")
 
+        # Marker count
+        r_mc = tk.Frame(tab, bg=BG_DARK); r_mc.pack(fill="x", padx=12, pady=4)
+        tk.Label(r_mc, text="Marker count:", bg=BG_DARK, fg=TEXT_SEC,
+                 font=FB, width=24, anchor="w").pack(side="left")
+        self._v_aruco_marker_count = tk.StringVar(
+            value=str(self.cfg.get("aruco_marker_count", 4)))
+        ttk.Combobox(r_mc, textvariable=self._v_aruco_marker_count,
+                     values=["4", "6", "8"], state="readonly",
+                     width=6, font=FL).pack(side="left")
+        tk.Label(r_mc, text="  4=corners only  6=+left/right midpoints  8=+top/bottom",
+                 bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=6)
+
+        # Pixel format (MJPEG prevents static-scene fps throttling)
+        r_pf = tk.Frame(tab, bg=BG_DARK); r_pf.pack(fill="x", padx=12, pady=4)
+        tk.Label(r_pf, text="Pixel format:", bg=BG_DARK, fg=TEXT_SEC,
+                 font=FB, width=24, anchor="w").pack(side="left")
+        self._v_camera_pixel_format = tk.StringVar(
+            value=self.cfg.get("camera_pixel_format", "Auto"))
+        ttk.Combobox(r_pf, textvariable=self._v_camera_pixel_format,
+                     values=["Auto", "MJPEG", "YUY2"], state="readonly",
+                     width=8, font=FL).pack(side="left")
+        tk.Label(r_pf, text="  MJPEG prevents fps throttling on static scenes",
+                 bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=6)
+
         self._section(tab, "Performance")
         r_nv = tk.Frame(tab, bg=BG_DARK); r_nv.pack(fill="x", padx=12, pady=4)
         tk.Label(r_nv, text="No video preview:", bg=BG_DARK, fg=TEXT_SEC,
@@ -2559,6 +2788,76 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(r_cl,
                  text="Adaptive contrast — improves tracking in uneven lighting",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=6)
+
+        r_cc = tk.Frame(tab, bg=BG_DARK); r_cc.pack(fill="x", padx=12, pady=4)
+        tk.Label(r_cc, text="CLAHE clip limit:", bg=BG_DARK, fg=TEXT_SEC,
+                 font=FB, width=24, anchor="w").pack(side="left")
+        self._v_clahe_clip = tk.StringVar(value=str(self.cfg.get("clahe_clip", 4.0)))
+        tk.Entry(r_cc, textvariable=self._v_clahe_clip, width=5, bg=BG_CARD,
+                 fg=TEXT_PRI, insertbackground=ACCENT, relief="flat",
+                 font=FM).pack(side="left")
+        for lbl, val in [("2",2.0),("4",4.0),("6",6.0),("8",8.0),("12",12.0)]:
+            tk.Button(r_cc, text=lbl,
+                      command=lambda v=val: self._v_clahe_clip.set(str(v)),
+                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
+                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+        tk.Label(r_cc, text="  2=mild  4=balanced  8=aggressive  12=extreme",
+                 bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
+
+        # Brightness target (software gain normalisation)
+        r_bt = tk.Frame(tab, bg=BG_DARK); r_bt.pack(fill="x", padx=12, pady=4)
+        tk.Label(r_bt, text="Brightness target:", bg=BG_DARK, fg=TEXT_SEC,
+                 font=FB, width=24, anchor="w").pack(side="left")
+        self._v_brightness_target = tk.StringVar(
+            value=str(self.cfg.get("brightness_target", 128.0)))
+        tk.Entry(r_bt, textvariable=self._v_brightness_target, width=5,
+                 bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
+                 relief="flat", font=FM).pack(side="left")
+        for lbl, val in [("64",64),("96",96),("128",128),("160",160),("192",192)]:
+            tk.Button(r_bt, text=lbl,
+                      command=lambda v=val: self._v_brightness_target.set(str(v)),
+                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
+                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+        tk.Label(r_bt, text="  lower=darker/faster  128=balanced  higher=brighter",
+                 bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
+
+        # Spike filter
+        self._section(tab, "Spike Filter")
+        self._note(tab, "Rejects bad homography spikes (marker briefly lost).\n"
+                        "Spike velocity: min mm/frame to flag as candidate.\n"
+                        "Reversal ratio: how sharply it must reverse (0-1).")
+        r_sv = tk.Frame(tab, bg=BG_DARK); r_sv.pack(fill="x", padx=12, pady=4)
+        tk.Label(r_sv, text="Spike velocity (mm/frame):", bg=BG_DARK, fg=TEXT_SEC,
+                 font=FB, width=24, anchor="w").pack(side="left")
+        self._v_spike_velocity_mm = tk.StringVar(
+            value=str(self.cfg.get("spike_velocity_mm", 25.0)))
+        tk.Entry(r_sv, textvariable=self._v_spike_velocity_mm, width=5,
+                 bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
+                 relief="flat", font=FM).pack(side="left")
+        for lbl, val in [("15",15),("20",20),("25",25),("35",35),("50",50)]:
+            tk.Button(r_sv, text=lbl,
+                      command=lambda v=val: self._v_spike_velocity_mm.set(str(v)),
+                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
+                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+        tk.Label(r_sv, text="  lower=more sensitive  25=default  higher=less sensitive",
+                 bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
+
+        r_sr = tk.Frame(tab, bg=BG_DARK); r_sr.pack(fill="x", padx=12, pady=4)
+        tk.Label(r_sr, text="Reversal ratio (0-1):", bg=BG_DARK, fg=TEXT_SEC,
+                 font=FB, width=24, anchor="w").pack(side="left")
+        self._v_spike_reversal = tk.StringVar(
+            value=str(self.cfg.get("spike_reversal", 0.7)))
+        tk.Entry(r_sr, textvariable=self._v_spike_reversal, width=5,
+                 bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
+                 relief="flat", font=FM).pack(side="left")
+        for lbl, val in [("0.5",0.5),("0.6",0.6),("0.7",0.7),("0.8",0.8),("0.9",0.9)]:
+            tk.Button(r_sr, text=lbl,
+                      command=lambda v=val: self._v_spike_reversal.set(str(v)),
+                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
+                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+        tk.Label(r_sr, text="  0.5=loose  0.7=default  0.9=strict",
+                 bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
+
         tk.Frame(tab, bg=BG_DARK, height=16).pack()   # bottom padding
 
     # ── Audio tab ─────────────────────────────────────────────────────────────
