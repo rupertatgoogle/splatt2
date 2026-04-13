@@ -843,8 +843,12 @@ class SplattApp:
         shot.score      = score
         shot.ring_index = ring
         shot.mark_index = mark_idx
-        if self.cfg.get("voice_enabled", True):
+
+        def _speek():
             pyttsx3.speak(f"{score:.1f}, {shot.clock_position} o'clock" if self._decimal_scoring else f"{int(score)} at {shot.clock_position} o'clock")
+
+        if self.cfg.get("voice_enabled", True):
+            threading.Thread(target=_speek).start()
 
         # Step 4: rewrite the live CSV row with the correct score
         if self.session._writer and self.session._writer.is_open:
